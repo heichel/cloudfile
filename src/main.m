@@ -2,7 +2,7 @@
 #import <FileProvider/FileProvider.h>
 
 void printUsage() {
-    printf("Usage: cloudfile <file-path> <command>\n");
+    printf("Usage: cloudfile <command> <file-path>\n");
     printf("Commands:\n");
     printf("  materialize - Download the file from the cloud\n");
     printf("  materialize-sync - Download the file from the cloud (synchronously)\n");
@@ -16,9 +16,9 @@ int main(int argc, const char * argv[]) {
             return 1;
         }
         
-        NSString *filePath = [NSString stringWithUTF8String:argv[1]];
-        NSString *command = [NSString stringWithUTF8String:argv[2]];
-        
+        NSString *command = [NSString stringWithUTF8String:argv[1]];
+        NSString *filePath = [NSString stringWithUTF8String:argv[2]];
+
         NSURL *fileURL = [NSURL fileURLWithPath:filePath];
         NSFileManager *fileManager = [NSFileManager defaultManager];
         
