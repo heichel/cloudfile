@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_OBJC_STANDARD 11)
 
 # Define the executable
-add_executable(cloudfile src/main.m)
+add_executable(cloudfile src/main.m src/cloudfile.m)
 
 # Link required frameworks
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)

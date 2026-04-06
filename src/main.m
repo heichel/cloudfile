@@ -1,12 +1,20 @@
-#import <Foundation/Foundation.h>
-#import <FileProvider/FileProvider.h>
+#import "cloudfile.h"
+#import <dispatch/dispatch.h>
+#import <stdatomic.h>
+
+// Limit concurrent dispatches to avoid GCD thread pool starvation. Without this,
+// hundreds of blocking poll loops (e.g. waitForMaterialization) exhaust the thread
+// pool and cause dispatch_group_wait to hang indefinitely.
+#define MAX_CONCURRENT_OPS 10
 
 void printUsage() {
-    printf("Usage: cloudfile <command> <file-path>\n");
+    printf("Usage: cloudfile <command> <path>\n");
     printf("Commands:\n");
-    printf("  materialize - Download the file from the cloud\n");
-    printf("  materialize-sync - Download the file from the cloud (synchronously)\n");
-    printf("  evict - Remove local copy while keeping it in the cloud\n");
+    printf("  materialize      - Download file(s) from the cloud\n");
+    printf("  materialize-sync - Download file(s) from the cloud (synchronously)\n");
+    printf("  evict            - Remove local copy while keeping it in the cloud\n");
+    printf("\n");
+    printf("<path> can be a file or directory. Directories are processed recursively.\n");
 }
 
 int main(int argc, const char * argv[]) {
@@ -15,92 +23,123 @@ int main(int argc, const char * argv[]) {
             printUsage();
             return 1;
         }
-        
+
         NSString *command = [NSString stringWithUTF8String:argv[1]];
-        NSString *filePath = [NSString stringWithUTF8String:argv[2]];
+        NSString *path = [NSString stringWithUTF8String:argv[2]];
 
-        NSURL *fileURL = [NSURL fileURLWithPath:filePath];
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        
+        NSArray<NSURL *> *fileURLs = collectFileURLs(path);
+        if (!fileURLs) return 1;
+        if (fileURLs.count == 0) {
+            NSLog(@"No files found at path: %@", path);
+            return 0;
+        }
+
+        NSLog(@"Processing %lu file(s)...", (unsigned long)fileURLs.count);
+
         if ([command isEqualToString:@"materialize"]) {
-            NSError *error = nil;
-            if (![fileManager startDownloadingUbiquitousItemAtURL:fileURL error:&error]) {
-                NSLog(@"Error materializing file: %@", error);
+            __block atomic_int failureCount = 0;
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            // Semaphore ensures at most MAX_CONCURRENT_OPS blocks run at once
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(MAX_CONCURRENT_OPS);
+
+            for (NSURL *fileURL in fileURLs) {
+                dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+                dispatch_group_async(group, queue, ^{
+                    int result = requestMaterialization(fileURL);
+                    if (result != 0) {
+                        atomic_fetch_add(&failureCount, 1);
+                    }
+                    dispatch_semaphore_signal(semaphore);
+                });
+            }
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+            int failed = atomic_load(&failureCount);
+            if (failed > 0) {
+                NSLog(@"%d file(s) failed to materialize.", failed);
                 return 1;
             }
-            NSLog(@"Requested materialization of file: %@", filePath);
+
+            NSLog(@"Requested materialization of %lu file(s).", (unsigned long)fileURLs.count);
         } else if ([command isEqualToString:@"materialize-sync"]) {
-            NSError *error = nil;
-            if (![fileManager startDownloadingUbiquitousItemAtURL:fileURL error:&error]) {
-                NSLog(@"Error materializing file: %@", error);
+            // Kick off all downloads in parallel first
+            __block atomic_int failureCount = 0;
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(MAX_CONCURRENT_OPS);
+
+            for (NSURL *fileURL in fileURLs) {
+                dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+                dispatch_group_async(group, queue, ^{
+                    int result = requestMaterialization(fileURL);
+                    if (result != 0) {
+                        atomic_fetch_add(&failureCount, 1);
+                    }
+                    dispatch_semaphore_signal(semaphore);
+                });
+            }
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+            int failed = atomic_load(&failureCount);
+            if (failed > 0) {
+                NSLog(@"%d file(s) failed to start materializing.", failed);
                 return 1;
             }
-            NSLog(@"Materializing file: %@ ...", filePath);
 
-            // Wait until downloaded locally
-            NSTimeInterval timeoutSeconds = 300; // adjust as desired
-            NSTimeInterval pollInterval = 0.2;
-            NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSeconds];
+            NSLog(@"Materializing %lu file(s) ...", (unsigned long)fileURLs.count);
 
-            while ([deadline timeIntervalSinceNow] > 0) {
-                @autoreleasepool {
-                    // Ask for relevant iCloud resource values
-                    // NSURL caches resource values, so clear between polls.
-                    [fileURL removeCachedResourceValueForKey:NSURLUbiquitousItemDownloadingStatusKey];
-                    [fileURL removeCachedResourceValueForKey:NSURLUbiquitousItemIsDownloadingKey];
-                    [fileURL removeCachedResourceValueForKey:NSURLUbiquitousItemDownloadingErrorKey];
+            // Wait for all downloads in parallel
+            failureCount = 0;
+            dispatch_group_t waitGroup = dispatch_group_create();
+            dispatch_semaphore_t waitSemaphore = dispatch_semaphore_create(MAX_CONCURRENT_OPS);
 
-                    NSDictionary<NSURLResourceKey, id> *values =
-                        [fileURL resourceValuesForKeys:@[
-                            NSURLUbiquitousItemDownloadingStatusKey,
-                            NSURLUbiquitousItemIsDownloadingKey,
-                            NSURLUbiquitousItemDownloadingErrorKey
-                        ] error:&error];
-
-                    if (!values) {
-                        // If the file provider is slow to answer, you can choose to keep waiting,
-                        // but usually better to fail fast.
-                        NSLog(@"Error reading resource values: %@", error);
-                        return 1;
+            for (NSURL *fileURL in fileURLs) {
+                dispatch_semaphore_wait(waitSemaphore, DISPATCH_TIME_FOREVER);
+                dispatch_group_async(waitGroup, queue, ^{
+                    int result = waitForMaterialization(fileURL);
+                    if (result != 0) {
+                        atomic_fetch_add(&failureCount, 1);
                     }
-
-                    error = values[NSURLUbiquitousItemDownloadingErrorKey];
-                    if (error) {
-                        NSLog(@"Download failed: %@", error);
-                        return 1;
-                    }
-
-                    NSString *status = values[NSURLUbiquitousItemDownloadingStatusKey];
-                    NSNumber *isDownloading = values[NSURLUbiquitousItemIsDownloadingKey];
-
-                    // "Current" means fully downloaded locally.
-                    BOOL statusReady = [status isEqualToString:NSURLUbiquitousItemDownloadingStatusCurrent] ||
-                                       [status isEqualToString:NSURLUbiquitousItemDownloadingStatusDownloaded];
-
-                    if (statusReady) {
-                        NSLog(@"Materialization complete: %@", filePath);
-                        break;
-                    }
-
-                    // Otherwise keep waiting.
-                    // (Even if isDownloading==NO, status may still be "NotDownloaded" or "Downloaded" etc.)
-                    (void)isDownloading;
-                }
-
-                [NSThread sleepForTimeInterval:pollInterval];
+                    dispatch_semaphore_signal(waitSemaphore);
+                });
             }
+            dispatch_group_wait(waitGroup, DISPATCH_TIME_FOREVER);
 
-            if ([deadline timeIntervalSinceNow] <= 0) {
-                NSLog(@"Timed out waiting for materialization: %@", filePath);
+            failed = atomic_load(&failureCount);
+            if (failed > 0) {
+                NSLog(@"%d file(s) failed to materialize.", failed);
                 return 1;
             }
+
+            NSLog(@"Materialized %lu file(s).", (unsigned long)fileURLs.count);
         } else if ([command isEqualToString:@"evict"]) {
-            NSError *error = nil;
-            if (![fileManager evictUbiquitousItemAtURL:fileURL error:&error]) {
-                NSLog(@"Error evicting file: %@", error);
+            __block atomic_int failureCount = 0;
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(MAX_CONCURRENT_OPS);
+
+            for (NSURL *fileURL in fileURLs) {
+                dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+                dispatch_group_async(group, queue, ^{
+                    NSFileManager *fileManager = [NSFileManager defaultManager];
+                    NSError *error = nil;
+                    if (![fileManager evictUbiquitousItemAtURL:fileURL error:&error]) {
+                        NSLog(@"Error evicting file %@: %@", fileURL.path, error);
+                        atomic_fetch_add(&failureCount, 1);
+                    }
+                    dispatch_semaphore_signal(semaphore);
+                });
+            }
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+            int failed = atomic_load(&failureCount);
+            if (failed > 0) {
+                NSLog(@"%d file(s) failed to evict.", failed);
                 return 1;
             }
-            NSLog(@"Evicted file: %@", filePath);
+
+            NSLog(@"Evicted %lu file(s).", (unsigned long)fileURLs.count);
         } else {
             printUsage();
             return 1;
